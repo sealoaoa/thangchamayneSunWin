@@ -1,0 +1,24 @@
+{
+  "name": "sunwin-predictor",
+  "version": "1.0.0",
+  "description": "Hệ thống dự đoán Tài Xỉu Sunwin với 25+ logic, tự động học và cập nhật",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": ["sunwin", "taixiu", "prediction", "websocket", "fastify"],
+  "author": "@tiendataox",
+  "license": "ISC",
+  "dependencies": {
+    "@fastify/websocket": "^10.0.1",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "fastify": "^4.24.3",
+    "sqlite3": "^5.1.6",
+    "ws": "^8.14.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
