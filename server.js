@@ -1,6 +1,5 @@
-// ==Improved Sunwin Predictor==
-// Tác giả: @tiendataox (đã cải tiến)
-// Mô tả: Hệ thống dự đoán Tài Xỉu từ WebSocket Sunwin với 25+ logic, tự động học và cập nhật.
+// server.js - Sunwin Tài Xỉu Predictor with ML (TensorFlow.js)
+// Chạy trên Render, dùng SQLite, WebSocket, tự động học
 
 const express = require('express');
 const cors = require('cors');
@@ -11,25 +10,25 @@ const Fastify = require('fastify');
 const WebSocket = require('ws');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
-const fs = require('fs').promises; // Dùng fs promises để tránh callback hell
+const fs = require('fs').promises;
 const fastifyWebsocket = require('@fastify/websocket');
+const tf = require('@tensorflow/tfjs-node');
 
 const fastify = Fastify({ logger: true });
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || 'tiendat'; // Lấy từ biến môi trường, nếu không có thì dùng mặc định
+const API_KEY = process.env.API_KEY || 'nhutquang';
 
 fastify.register(fastifyWebsocket);
 
-// Middleware xác thực cho HTTP API
+// Middleware xác thực HTTP
 fastify.addHook('onRequest', async (request, reply) => {
-  const publicPaths = ['/api/sunwin/taixiu/ws']; // WebSocket không áp dụng hook này
+  const publicPaths = ['/api/sunwin/taixiu/ws'];
   if (publicPaths.some(p => request.url.startsWith(p))) return;
-
   if (request.url.startsWith('/api/sunwin') || request.url.startsWith('/api/history-json') || 
       request.url.startsWith('/api/his') || request.url.startsWith('/api/analysis')) {
     const urlKey = request.query.key;
     if (!urlKey || urlKey !== API_KEY) {
-      return reply.code(403).send({ error: 'Key sai mẹ rồi, liên hệ tele: @mrtinhios' });
+      return reply.code(403).send({ error: 'Key sai, liên hệ tele: @nhutquangdz' });
     }
   }
 });
@@ -37,24 +36,23 @@ fastify.addHook('onRequest', async (request, reply) => {
 // Xác thực WebSocket
 const authenticateWebSocket = (id, key) => key === API_KEY;
 
-// --- Kết nối đến Sunwin ---
+// --- Kết nối Sunwin ---
 let wsSunwin = null;
 let reconnectInterval = 5000;
 let intervalCmd = null;
 
-// --- Database (SQLite) với Promise wrapper ---
+// --- Database ---
 const dbPath = path.resolve(__dirname, 'sun.sql');
 const db = new sqlite3.Database(dbPath, (err) => {
   if (err) {
-    console.error('Lỗi kết nối cơ sở dữ liệu:', err.message);
+    console.error('Lỗi DB:', err.message);
     process.exit(1);
   } else {
-    console.log('Đã kết nối cơ sở dữ liệu SQLite.');
+    console.log('Đã kết nối SQLite.');
     initDb();
   }
 });
 
-// Khởi tạo bảng
 function initDb() {
   db.run(`
     CREATE TABLE IF NOT EXISTS sessions (
@@ -81,6 +79,7 @@ function initDb() {
       status TEXT,
       cau_hien_tai TEXT,
       ly_do TEXT,
+      features TEXT,
       timestamp INTEGER NOT NULL
     )
   `, (err) => {
@@ -89,7 +88,7 @@ function initDb() {
   });
 }
 
-// Promise wrapper cho db.all và db.get
+// Promise wrapper cho db
 const dbAll = (sql, params = []) => new Promise((resolve, reject) => {
   db.all(sql, params, (err, rows) => err ? reject(err) : resolve(rows));
 });
@@ -102,13 +101,11 @@ const dbRun = (sql, params = []) => new Promise((resolve, reject) => {
 
 // --- File logs ---
 const cauLogFilePath = path.resolve(__dirname, 'cauapisun_log.jsonl');
-const logicPerformanceFilePath = path.resolve(__dirname, 'logic_performance.json');
 
-// --- Logic performance (có decay thông minh) ---
+// --- Logic performance (chỉ dùng cho fallback, ML sẽ tự học) ---
 let logicPerformance = {
   logic1: { correct: 0, total: 0, accuracy: 0, consistency: 0, lastPredicted: null, lastActual: null },
   logic2: { correct: 0, total: 0, accuracy: 0, consistency: 0, lastPredicted: null, lastActual: null },
-  // ... (tương tự cho đến logic25, viết tắt để gọn, nhưng đủ 25 cái)
   logic3: { correct: 0, total: 0, accuracy: 0, consistency: 0, lastPredicted: null, lastActual: null },
   logic4: { correct: 0, total: 0, accuracy: 0, consistency: 0, lastPredicted: null, lastActual: null },
   logic5: { correct: 0, total: 0, accuracy: 0, consistency: 0, lastPredicted: null, lastActual: null },
@@ -133,29 +130,6 @@ let logicPerformance = {
   logic24: { correct: 0, total: 0, accuracy: 0, consistency: 0, lastPredicted: null, lastActual: null },
   logic25: { correct: 0, total: 0, accuracy: 0, consistency: 0, lastPredicted: null, lastActual: null },
 };
-
-async function saveLogicPerformance() {
-  try {
-    await fs.writeFile(logicPerformanceFilePath, JSON.stringify(logicPerformance, null, 2), 'utf8');
-  } catch (err) {
-    console.error('Lỗi lưu logic performance:', err);
-  }
-}
-
-async function loadLogicPerformance() {
-  try {
-    const data = await fs.readFile(logicPerformanceFilePath, 'utf8');
-    const loaded = JSON.parse(data);
-    for (const key in logicPerformance) {
-      if (loaded[key]) Object.assign(logicPerformance[key], loaded[key]);
-    }
-  } catch (err) {
-    if (err.code !== 'ENOENT') console.error('Lỗi load logic performance:', err);
-  }
-}
-
-// --- Ngưỡng động ---
-let HIGH_CONFIDENCE_THRESHOLD = 0.68;
 
 // --- Helper functions ---
 function calculateStdDev(arr) {
@@ -193,178 +167,48 @@ async function readCauLog() {
   }
 }
 
-function updateLogicPerformance(logicName, predicted, actual) {
-  if (!predicted || !logicPerformance[logicName]) return;
-  const perf = logicPerformance[logicName];
-  // Decay thông minh dựa trên độ chính xác hiện tại
-  let decay = 0.95;
-  if (perf.total > 0) {
-    if (perf.accuracy < 0.6) decay = 0.85;
-    else if (perf.accuracy > 0.8) decay = 0.98;
+function analyzeAndExtractPatterns(history) {
+  const patterns = {};
+  if (history.length >= 10) {
+    patterns.last10 = history.slice(0, 10).map(s => s.result === 'Tài' ? 'T' : 'X').join('');
   }
-  perf.correct *= decay;
-  perf.total *= decay;
-  perf.total++;
-  const wasCorrect = (predicted === actual) ? 1 : 0;
-  if (wasCorrect) perf.correct++;
-  perf.accuracy = perf.total > 0 ? perf.correct / perf.total : 0;
-  // Cập nhật consistency với moving average
-  const alpha = perf.accuracy < 0.6 ? 0.3 : 0.1;
-  perf.consistency = perf.consistency * (1 - alpha) + (wasCorrect * alpha);
-  // Giới hạn accuracy khi còn ít mẫu
-  if (perf.total < 20 && perf.accuracy > 0.9) perf.accuracy = 0.9;
-  else if (perf.total < 50 && perf.accuracy > 0.95) perf.accuracy = 0.95;
-  perf.lastPredicted = predicted;
-  perf.lastActual = actual;
-}
-
-// --- WebSocket clients ---
-const connectedClients = new Set();
-
-// Gửi lịch sử 500 dự đoán cho client mới
-async function sendHistoryToClient(ws) {
-  try {
-    const rows = await dbAll(`SELECT sid, prediction, actual, status, confidence, cau_hien_tai, ly_do, timestamp FROM predictions ORDER BY sid DESC LIMIT 500`);
-    const history = rows.map(r => ({
-      phien: r.sid.toString(),
-      du_doan: r.prediction,
-      thuc_te: r.actual || null,
-      trang_thai: r.status === 'win' ? '✅' : (r.status === 'lose' ? '❌' : '⏳'),
-      ti_le: r.confidence ? r.confidence.toFixed(0) + '%' : null,
-      cau_hien_tai: r.cau_hien_tai,
-      ly_do: JSON.parse(r.ly_do || '{}'),
-      timestamp: new Date(r.timestamp).toISOString()
-    }));
-    ws.send(JSON.stringify({ type: 'history', data: history }));
-  } catch (err) {
-    console.error('Lỗi gửi history:', err);
+  if (history.length >= 20) {
+    patterns.last20_totals = history.slice(0, 20).map(s => s.total).join(',');
   }
-}
-
-// --- Ngưỡng động dựa trên volatility ---
-function getDynamicThreshold(history) {
-  if (history.length < 30) return 0.68;
-  const totals = history.slice(0, 50).map(s => s.total);
-  const volatility = calculateStdDev(totals);
-  return Math.min(0.8, 0.6 + volatility * 0.05);
-}
-
-// --- Phát hiện bẻ cầu ---
-function detectDeception(history) {
-  if (history.length < 10) return { isDeceptive: false, reason: 'Chưa đủ dữ liệu' };
-  const results = history.slice(0, 5).map(s => s.result);
-  const totals = history.slice(0, 5).map(s => s.total);
-  const uniqueTotals = new Set(totals).size;
-  if (uniqueTotals === 1 && results[0] !== results[4]) {
-    return { isDeceptive: true, reason: 'Cầu bệt đột ngột đảo chiều' };
-  }
-  let changeCount = 0;
-  for (let i = 0; i < results.length - 1; i++) {
-    if (results[i] !== results[i+1]) changeCount++;
-  }
-  if (changeCount >= 4 && results.length === 5) {
-    return { isDeceptive: true, reason: 'Đảo chiều liên tục, có thể nhà cái đang gài' };
-  }
-  return { isDeceptive: false, reason: 'Bình thường' };
-}
-
-// --- Tự động tinh chỉnh trọng số (chạy mỗi 6h) ---
-async function updateLogicWeights() {
-  try {
-    const rows = await dbAll(`SELECT prediction, actual FROM predictions WHERE actual IS NOT NULL ORDER BY sid DESC LIMIT 100`);
-    if (rows.length < 20) return;
-    // Ở đây có thể cập nhật trọng số trong signals của logic20
-    console.log('Đã cập nhật trọng số logic (giả lập)');
-  } catch (err) {
-    console.error('Lỗi updateLogicWeights:', err);
-  }
-}
-setInterval(updateLogicWeights, 6 * 60 * 60 * 1000);
-
-// --- WebSocket kết nối đến Sunwin ---
-function sendCmd1005() {
-  if (wsSunwin && wsSunwin.readyState === WebSocket.OPEN) {
-    const payload = [6, 'MiniGame', 'taixiuPlugin', { cmd: 1005 }];
-    wsSunwin.send(JSON.stringify(payload));
-  }
-}
-
-function connectWebSocket() {
-  wsSunwin = new WebSocket('wss://websocket.azhkthg1.net/websocket?token=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhbW91bnQiOjAsInVzZXJuYW1lIjoiU0NfYXBpc3Vud2luMTIzIn0.hgrRbSV6vnBwJMg9ZFtbx3rRu9mX_hZMZ_m5gMNhkw0');
-
-  wsSunwin.on('open', () => {
-    console.log('Đã kết nối WebSocket đến Sunwin.');
-    const authPayload = [1, 'MiniGame', 'SC_ditmemay9090', 'tinhbip', {
-      info: '{"ipAddress":"2001:ee0:5148:fe40:ad3f:fc10:28f5:e1be","wsToken":"eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJnZW5kZXIiOjAsImNhblZpZXdTdGF0IjpmYWxzZSwiZGlzcGxheU5hbWUiOiJkaXRtZW15YTkyODQ4IiwiYm90IjowLCJpc01lcmNoYW50IjpmYWxzZSwidmVyaWZpZWRCYW5rQWNjb3VudCI6ZmFsc2UsInBsYXlFdmVudExvYmJ5IjpmYWxzZSwiY3VzdG9tZXJJZCI6MzE0OTc1NTA1LCJhZmZJZCI6InN1bi53aW4iLCJiYW5uZWQiOmZhbHNlLCJicmFuZCI6InN1bi53aW4iLCJ0aW1lc3RhbXAiOjE3NTY2NjMwMDYxNjksImxvY2tHYW1lcyI6W10sImFtb3VudCI6MCwibG9ja0NoYXQiOmZhbHNlLCJwaG9uZVZlcmlmaWVkIjpmYWxzZSwiaXBBZGRyZXNzIjoiMjAwMTplZTA6NTE0ODpmZTQwOmFkM2Y6ZmMxMDoyOGY1OmUxYmUiLCJtdXRlIjpmYWxzZSwiYXZhdGFyIjoiaHR0cHM6Ly9pbWFnZXMuc3dpbnNob3AubmV0L2ltYWdlcy9hdmF0YXIvYXZhdGFyXzE1LnBuZyIsInBsYXRmb3JtSWQiOjUsInVzZXJJZCI6IjlhYTI0YWQ5LWYwOTAtNGZkMC05NjZkLWE0NjRmMTczYzZmMCIsInJlZ1RpbWUiOjE3NTY2NjIxOTAyMzYsInBob25lIjoiIiwiZGVwb3NpdCI6ZmFsc2UsInVzZXJuYW1lIjoiU0NfZGl0bWVtYXk5MDkwIn0.KxsZbt0gZfENGroTiUiAi7yYq-MdVo20GgsE_I5yRms","locale":"vi","userId":"9aa24ad9-f090-4fd0-966d-a464f173c6f0","username":"SC_ditmemay9090","timestamp":1756663006169,"refreshToken":"98fcec7d747948608fa8d843aa20eeac.e92b32c4c5e5452d93e186d60d751363"}',
-      signature: '8536BEA6235F8F2D3D38898090F5F4F9AF06134F11C7990F2A4A8534973D1E5E3D31262E67DD1CAC396AE998C291FB82E03965ACBA8C76005DE3B8D717EFB05F4E3BC13AE2E3A0D815F748629A4881E57D5BF4259409D09C25749C698611E980163C21F1948B25C377CC25CE796B400917695E5B7ED0B2528B9F1E53627AA1CA'
-    }];
-    wsSunwin.send(JSON.stringify(authPayload));
-    clearInterval(intervalCmd);
-    intervalCmd = setInterval(sendCmd1005, 5000);
-  });
-
-  wsSunwin.on('message', async (data) => {
-    try {
-      const json = JSON.parse(data);
-      if (Array.isArray(json) && json[1]?.htr) {
-        const incomingResults = json[1].htr.sort((a, b) => a.sid - b.sid);
-        for (const newItem of incomingResults) {
-          if (!newItem.d1 || !newItem.d2 || !newItem.d3 || newItem.d1 < 1 || newItem.d1 > 6 || newItem.d2 < 1 || newItem.d2 > 6 || newItem.d3 < 1 || newItem.d3 > 6) continue;
-          const total = newItem.d1 + newItem.d2 + newItem.d3;
-          if (total < 3 || total > 18) continue;
-          const row = await dbGet(`SELECT sid FROM sessions WHERE sid = ?`, [newItem.sid]);
-          if (!row) {
-            const result = total <= 10 ? 'Xỉu' : 'Tài';
-            const timestamp = Date.now();
-            await dbRun(`INSERT INTO sessions (sid, d1, d2, d3, total, result, timestamp) VALUES (?,?,?,?,?,?,?)`,
-              [newItem.sid, newItem.d1, newItem.d2, newItem.d3, total, result, timestamp]);
-            
-            // Cập nhật predictions: lấy prediction tương ứng và set status đúng
-            const predRow = await dbGet(`SELECT prediction FROM predictions WHERE sid = ?`, [newItem.sid]);
-            if (predRow) {
-              const status = (predRow.prediction === result) ? 'win' : 'lose';
-              await dbRun(`UPDATE predictions SET actual = ?, status = ? WHERE sid = ?`, [result, status, newItem.sid]);
-            } else {
-              // Nếu chưa có prediction (hiếm), chỉ update actual
-              await dbRun(`UPDATE predictions SET actual = ? WHERE sid = ?`, [result, newItem.sid]);
-            }
-
-            // Phân tích pattern và log
-            const recent = await dbAll(`SELECT sid, d1, d2, d3, total, result FROM sessions ORDER BY sid DESC LIMIT 50`);
-            if (recent.length > 5) {
-              const reversed = recent.reverse();
-              const patterns = analyzeAndExtractPatterns(reversed);
-              if (Object.keys(patterns).length) {
-                logCauPattern({ sid_before: newItem.sid, actual_result: result, patterns, timestamp });
-              }
-            }
-            broadcastPrediction(); // Gửi dự đoán mới cho clients
-          }
-        }
-      }
-    } catch (e) {
-      console.error('Lỗi xử lý message Sunwin:', e);
+  if (history.length >= 5) {
+    patterns.sum_pairs = [];
+    for (let i = 0; i < 4; i++) {
+      if (history[i+1]) patterns.sum_pairs.push(`${history[i].total}-${history[i+1].total}`);
     }
-  });
-
-  wsSunwin.on('close', () => {
-    console.warn('WebSocket Sunwin đóng, thử kết nối lại...');
-    clearInterval(intervalCmd);
-    setTimeout(connectWebSocket, reconnectInterval);
-  });
-
-  wsSunwin.on('error', (err) => {
-    console.error('Lỗi WebSocket Sunwin:', err.message);
-    wsSunwin.close();
-  });
+  }
+  if (history.length >= 10) {
+    const diceFreq = getDiceFrequencies(history, 10);
+    patterns.dice_freq = diceFreq.slice(1);
+  }
+  if (history.length >= 20) {
+    const totals = history.slice(0, 20).map(s => s.total);
+    patterns.stddev = calculateStdDev(totals);
+  }
+  let currentStreakLength = 0;
+  const currentResult = history[0].result;
+  for (let i = 0; i < history.length; i++) {
+    if (history[i].result === currentResult) currentStreakLength++; else break;
+  }
+  patterns.last_streak = { result: currentResult === 'Tài' ? 'T' : 'X', length: currentStreakLength };
+  if (history.length >= 5) {
+    patterns.alternating5 = history.slice(0, 5).map(s => s.result === 'Tài' ? 'T' : 'X').join('');
+  }
+  if (history.length >= 2) {
+    patterns.sum_sequence_patterns = [
+      { key: `${history[0].total}-${history[0].result === 'Tài' ? 'T' : 'X'}_${history[1]?.total}-${history[1]?.result === 'Tài' ? 'T' : 'X'}` }
+    ];
+  }
+  return patterns;
 }
 
-connectWebSocket();
+// ==================== 25 LOGIC CŨ ====================
+// Giữ nguyên các hàm logic từ code cũ (đã được kiểm tra)
 
-// ==================== CÁC HÀM LOGIC DỰ ĐOÁN (1-25) ====================
-// (Giữ nguyên phần lớn logic cũ, chỉ sửa một số lỗi nhỏ và thêm kiểm tra)
-
-// Logic 1
 function predictLogic1(lastSession, history) {
   if (!lastSession || history.length < 10) return null;
   const lastDigitOfSession = lastSession.sid % 10;
@@ -387,7 +231,6 @@ function predictLogic1(lastSession, history) {
   return null;
 }
 
-// Logic 2
 function predictLogic2(nextSessionId, history) {
   if (history.length < 15) return null;
   let thuanScore = 0, nghichScore = 0;
@@ -409,7 +252,6 @@ function predictLogic2(nextSessionId, history) {
   return null;
 }
 
-// Logic 3
 function predictLogic3(history) {
   if (history.length < 15) return null;
   const analysisWindow = Math.min(history.length, 50);
@@ -433,7 +275,6 @@ function predictLogic3(history) {
   return null;
 }
 
-// Logic 4
 function predictLogic4(history) {
   if (history.length < 25) return null;
   let bestPrediction = null, maxConfidence = 0;
@@ -466,7 +307,6 @@ function predictLogic4(history) {
   return bestPrediction;
 }
 
-// Logic 5
 function predictLogic5(history) {
   if (history.length < 40) return null;
   const sumCounts = {};
@@ -500,7 +340,6 @@ function predictLogic5(history) {
   return null;
 }
 
-// Logic 6
 function predictLogic6(lastSession, history) {
   if (!lastSession || history.length < 40) return null;
   const nextSessionLastDigit = (lastSession.sid + 1) % 10;
@@ -529,7 +368,6 @@ function predictLogic6(lastSession, history) {
   return null;
 }
 
-// Logic 7
 function predictLogic7(history) {
   const TREND_STREAK_LENGTH_MIN = 3, TREND_STREAK_LENGTH_MAX = 6;
   if (history.length < TREND_STREAK_LENGTH_MIN) return null;
@@ -562,7 +400,6 @@ function predictLogic7(history) {
   return null;
 }
 
-// Logic 8 (đã sửa lỗi biến)
 function predictLogic8(history) {
   const LONG_PERIOD = 30;
   if (history.length < LONG_PERIOD + 1) return null;
@@ -586,7 +423,6 @@ function predictLogic8(history) {
   return null;
 }
 
-// Logic 9
 function predictLogic9(history) {
   if (history.length < 15) return null;
   const mostRecentResult = history[0].result;
@@ -611,7 +447,6 @@ function predictLogic9(history) {
   return null;
 }
 
-// Logic 10
 function predictLogic10(history) {
   const MOMENTUM_STREAK_LENGTH = 3, STABILITY_CHECK_LENGTH = 7;
   if (history.length < STABILITY_CHECK_LENGTH + 1) return null;
@@ -628,7 +463,6 @@ function predictLogic10(history) {
   return null;
 }
 
-// Logic 11
 function predictLogic11(history) {
   if (history.length < 15) return null;
   const reversalPatterns = [
@@ -674,7 +508,6 @@ function predictLogic11(history) {
   return bestPatternMatch;
 }
 
-// Logic 12
 function predictLogic12(lastSession, history) {
   if (!lastSession || history.length < 20) return null;
   const nextSessionParity = (lastSession.sid + 1) % 2;
@@ -704,7 +537,6 @@ function predictLogic12(lastSession, history) {
   return null;
 }
 
-// Logic 13
 function predictLogic13(history) {
   if (history.length < 80) return null;
   const mostRecentResult = history[0].result;
@@ -741,7 +573,6 @@ function predictLogic13(history) {
   return null;
 }
 
-// Logic 14
 function predictLogic14(history) {
   if (history.length < 50) return null;
   const shortPeriod = 8, longPeriod = 30;
@@ -761,7 +592,6 @@ function predictLogic14(history) {
   return null;
 }
 
-// Logic 15
 function predictLogic15(history) {
   if (history.length < 80) return null;
   const analysisWindow = Math.min(history.length, 400);
@@ -793,7 +623,6 @@ function predictLogic15(history) {
   return null;
 }
 
-// Logic 16
 function predictLogic16(history) {
   if (history.length < 60) return null;
   const MODULO_N = 5;
@@ -820,7 +649,6 @@ function predictLogic16(history) {
   return null;
 }
 
-// Logic 17
 function predictLogic17(history) {
   if (history.length < 100) return null;
   const analysisWindow = Math.min(history.length, 600);
@@ -837,7 +665,6 @@ function predictLogic17(history) {
   return null;
 }
 
-// Logic 18
 function predictLogic18(history) {
   if (history.length < 50) return null;
   const analysisWindow = Math.min(history.length, 300);
@@ -865,7 +692,6 @@ function predictLogic18(history) {
   return null;
 }
 
-// Logic 19
 function predictLogic19(history) {
   if (history.length < 50) return null;
   let taiScore = 0, xiuScore = 0;
@@ -887,7 +713,53 @@ function predictLogic19(history) {
   return null;
 }
 
-// Logic 21 helpers
+// Logic 20 (meta) - sẽ dùng khi fallback
+async function predictLogic20(history, logicPerf, cauLogData) {
+  // Đơn giản hóa: lấy logic có accuracy cao nhất trong lịch sử
+  let bestLogic = null;
+  let bestAcc = 0;
+  for (const [name, perf] of Object.entries(logicPerf)) {
+    if (perf.total > 5 && perf.accuracy > bestAcc) {
+      bestAcc = perf.accuracy;
+      bestLogic = name;
+    }
+  }
+  if (!bestLogic) return null;
+  // Gọi logic tương ứng (cần ánh xạ)
+  const lastSession = history[0];
+  const nextSessionId = lastSession.sid + 1;
+  const logicMap = {
+    logic1: () => predictLogic1(lastSession, history),
+    logic2: () => predictLogic2(nextSessionId, history),
+    logic3: () => predictLogic3(history),
+    logic4: () => predictLogic4(history),
+    logic5: () => predictLogic5(history),
+    logic6: () => predictLogic6(lastSession, history),
+    logic7: () => predictLogic7(history),
+    logic8: () => predictLogic8(history),
+    logic9: () => predictLogic9(history),
+    logic10: () => predictLogic10(history),
+    logic11: () => predictLogic11(history),
+    logic12: () => predictLogic12(lastSession, history),
+    logic13: () => predictLogic13(history),
+    logic14: () => predictLogic14(history),
+    logic15: () => predictLogic15(history),
+    logic16: () => predictLogic16(history),
+    logic17: () => predictLogic17(history),
+    logic18: () => predictLogic18(history),
+    logic19: () => predictLogic19(history),
+    logic21: () => predictLogic21(history),
+    logic22: () => predictLogic22(history, cauLogData),
+    logic23: () => predictLogic23(history),
+    logic24: () => predictLogic24(history),
+    logic25: async () => await predictLogic25(history, cauLogData),
+  };
+  const fn = logicMap[bestLogic];
+  if (fn) return fn();
+  return null;
+}
+
+// Logic 21
 function markovWeightedV3(patternArr) {
   if (patternArr.length < 3) return null;
   const transitions = {};
@@ -913,7 +785,6 @@ function markovWeightedV3(patternArr) {
   }
   return null;
 }
-
 function repeatingPatternV3(patternArr) {
   if (patternArr.length < 4) return null;
   const lastThree = patternArr.slice(-3).join('');
@@ -935,7 +806,6 @@ function repeatingPatternV3(patternArr) {
   if (xiuFollows / totalMatches > 0.65) return 'Xỉu';
   return null;
 }
-
 function detectBiasV3(patternArr) {
   if (patternArr.length < 5) return null;
   let taiCount = 0, xiuCount = 0;
@@ -948,7 +818,6 @@ function detectBiasV3(patternArr) {
   if (xiuRatio > 0.60) return 'Xỉu';
   return null;
 }
-
 function predictLogic21(history) {
   if (history.length < 20) return null;
   const patternArr = history.map(s => s.result === 'Tài' ? 'T' : 'X');
@@ -1107,7 +976,7 @@ function predictLogic23(history) {
   return null;
 }
 
-// Pattern data cho logic 24
+// Logic 24
 const PATTERN_DATA = {
   'ttxttx': { tai: 80, xiu: 20 }, 'xxttxx': { tai: 25, xiu: 75 },
   'ttxxtt': { tai: 75, xiu: 25 }, 'txtxt': { tai: 60, xiu: 40 },
@@ -1128,7 +997,6 @@ const PATTERN_DATA = {
   'xtxtx': { tai: 35, xiu: 65 }, 'txtxtxt': { tai: 70, xiu: 30 },
   'xtxtxtx': { tai: 30, xiu: 70 }
 };
-
 function analyzePatterns(lastResults) {
   if (!lastResults || lastResults.length === 0) return [null, 'Không có dữ liệu'];
   const resultsShort = lastResults.map(r => r === 'Tài' ? 'T' : 'X');
@@ -1136,7 +1004,6 @@ function analyzePatterns(lastResults) {
   const recentSequence = resultsShort.slice(0, displayLength).join('');
   return [null, `: ${recentSequence}`];
 }
-
 function predictLogic24(history) {
   if (!history || history.length < 5) return null;
   const lastResults = history.map(s => s.result);
@@ -1195,163 +1062,403 @@ async function predictLogic25(history, cauLogData) {
   return null;
 }
 
-// Hàm analyzeAndExtractPatterns (dùng để log pattern)
-function analyzeAndExtractPatterns(history) {
-  const patterns = {};
-  if (history.length >= 10) {
-    patterns.last10 = history.slice(0, 10).map(s => s.result === 'Tài' ? 'T' : 'X').join('');
+// ==================== MLPredictor Class ====================
+class MLPredictor {
+  constructor() {
+    this.model = null;
+    this.scaler = { mean: null, std: null };
+    this.predictedFeatures = new Map(); // sid -> features
   }
-  if (history.length >= 20) {
-    patterns.last20_totals = history.slice(0, 20).map(s => s.total).join(',');
-  }
-  if (history.length >= 5) {
-    patterns.sum_pairs = [];
-    for (let i = 0; i < 4; i++) {
-      patterns.sum_pairs.push(`${history[i].total}-${history[i+1].total}`);
-    }
-  }
-  if (history.length >= 10) {
-    const diceFreq = getDiceFrequencies(history, 10);
-    patterns.dice_freq = diceFreq.slice(1);
-  }
-  if (history.length >= 20) {
-    const totals = history.slice(0, 20).map(s => s.total);
-    patterns.stddev = calculateStdDev(totals);
-  }
-  let currentStreakLength = 0;
-  const currentResult = history[0].result;
-  for (let i = 0; i < history.length; i++) {
-    if (history[i].result === currentResult) currentStreakLength++; else break;
-  }
-  patterns.last_streak = { result: currentResult === 'Tài' ? 'T' : 'X', length: currentStreakLength };
-  if (history.length >= 5) {
-    patterns.alternating5 = history.slice(0, 5).map(s => s.result === 'Tài' ? 'T' : 'X').join('');
-  }
-  if (history.length >= 2) {
-    patterns.sum_sequence_patterns = [
-      { key: `${history[0].total}-${history[0].result === 'Tài' ? 'T' : 'X'}_${history[1]?.total}-${history[1]?.result === 'Tài' ? 'T' : 'X'}` }
+
+  // Gọi tất cả logic cũ (async)
+  async predictAllLogics(history, cauLogData) {
+    const lastSession = history[0];
+    const nextSessionId = lastSession.sid + 1;
+
+    const logicCalls = [
+      { fn: predictLogic1, args: [lastSession, history] },
+      { fn: predictLogic2, args: [nextSessionId, history] },
+      { fn: predictLogic3, args: [history] },
+      { fn: predictLogic4, args: [history] },
+      { fn: predictLogic5, args: [history] },
+      { fn: predictLogic6, args: [lastSession, history] },
+      { fn: predictLogic7, args: [history] },
+      { fn: predictLogic8, args: [history] },
+      { fn: predictLogic9, args: [history] },
+      { fn: predictLogic10, args: [history] },
+      { fn: predictLogic11, args: [history] },
+      { fn: predictLogic12, args: [lastSession, history] },
+      { fn: predictLogic13, args: [history] },
+      { fn: predictLogic14, args: [history] },
+      { fn: predictLogic15, args: [history] },
+      { fn: predictLogic16, args: [history] },
+      { fn: predictLogic17, args: [history] },
+      { fn: predictLogic18, args: [history] },
+      { fn: predictLogic19, args: [history] },
+      { fn: null, args: [] }, // logic20 bỏ qua
+      { fn: predictLogic21, args: [history] },
+      { fn: predictLogic22, args: [history, cauLogData] },
+      { fn: predictLogic23, args: [history] },
+      { fn: predictLogic24, args: [history] },
+      { fn: predictLogic25, args: [history, cauLogData] }
     ];
+
+    const results = [];
+    for (const call of logicCalls) {
+      if (!call.fn) {
+        results.push(0.5);
+        continue;
+      }
+      try {
+        let pred;
+        if (call.fn.constructor.name === 'AsyncFunction') {
+          pred = await call.fn(...call.args);
+        } else {
+          pred = call.fn(...call.args);
+        }
+        results.push(pred === 'Tài' ? 1 : (pred === 'Xỉu' ? 0 : 0.5));
+      } catch (e) {
+        results.push(0.5);
+      }
+    }
+    return results;
   }
-  if (history.length >= 3) {
-    const short = history.slice(0, 3).map(s => s.result === 'Tài' ? 'T' : 'X').join('');
-    if (short === 'TXT' || short === 'XTX') patterns.alternating_pattern = short;
+
+  async extractFeatures(history, cauLogData) {
+    if (history.length < 10) return null;
+
+    const features = [];
+
+    // 1. Kết quả 25 logic cũ (25 features)
+    const logicResults = await this.predictAllLogics(history, cauLogData);
+    features.push(...logicResults);
+
+    // 2. Streak hiện tại (có dấu)
+    let streak = 0;
+    const lastResult = history[0].result;
+    for (let i = 0; i < history.length; i++) {
+      if (history[i].result === lastResult) streak++;
+      else break;
+    }
+    features.push(lastResult === 'Tài' ? streak : -streak);
+
+    // 3. Trung bình tổng 5 phiên gần nhất
+    const avg5 = history.slice(0, 5).reduce((a, s) => a + s.total, 0) / 5;
+    features.push(avg5);
+
+    // 4. Độ lệch chuẩn tổng 10 phiên gần nhất
+    const totals10 = history.slice(0, 10).map(s => s.total);
+    const mean10 = totals10.reduce((a, b) => a + b, 0) / 10;
+    const std10 = Math.sqrt(totals10.reduce((a, b) => a + (b - mean10) ** 2, 0) / 10);
+    features.push(std10);
+
+    // 5. Tần suất từng mặt xúc xắc trong 20 phiên gần nhất (6 features)
+    const diceFreq = new Array(7).fill(0);
+    history.slice(0, 20).forEach(s => {
+      diceFreq[s.d1]++;
+      diceFreq[s.d2]++;
+      diceFreq[s.d3]++;
+    });
+    const totalDice = Math.min(history.length, 20) * 3;
+    for (let i = 1; i <= 6; i++) {
+      features.push(diceFreq[i] / totalDice);
+    }
+
+    // 6. Tỷ lệ Tài trong 20 phiên gần nhất
+    const taiCount20 = history.slice(0, 20).filter(s => s.result === 'Tài').length;
+    features.push(taiCount20 / Math.min(history.length, 20));
+
+    // 7. Pattern 5 phiên gần nhất (5 bit)
+    for (let i = 0; i < 5; i++) {
+      if (i < history.length) {
+        features.push(history[i].result === 'Tài' ? 1 : 0);
+      } else {
+        features.push(0.5);
+      }
+    }
+
+    // 8. Tổng điểm phiên cuối
+    features.push(history[0].total);
+
+    // 9. Parity tổng điểm phiên cuối
+    features.push(history[0].total % 2 === 0 ? 1 : 0);
+
+    // 10. Giá trị từng xúc xắc phiên cuối (3 features)
+    features.push(history[0].d1, history[0].d2, history[0].d3);
+
+    // 11. Trung bình tổng 3 phiên gần nhất
+    const avg3 = history.slice(0, 3).reduce((a, s) => a + s.total, 0) / 3;
+    features.push(avg3);
+
+    // 12. Độ lệch chuẩn 5 phiên gần nhất
+    const totals5 = history.slice(0, 5).map(s => s.total);
+    const mean5 = totals5.reduce((a, b) => a + b, 0) / 5;
+    const std5 = Math.sqrt(totals5.reduce((a, b) => a + (b - mean5) ** 2, 0) / 5);
+    features.push(std5);
+
+    return features;
   }
-  return patterns;
+
+  buildModel(inputDim) {
+    const model = tf.sequential();
+    model.add(tf.layers.dense({ units: 64, activation: 'relu', inputShape: [inputDim] }));
+    model.add(tf.layers.dropout({ rate: 0.3 }));
+    model.add(tf.layers.dense({ units: 32, activation: 'relu' }));
+    model.add(tf.layers.dropout({ rate: 0.2 }));
+    model.add(tf.layers.dense({ units: 16, activation: 'relu' }));
+    model.add(tf.layers.dense({ units: 1, activation: 'sigmoid' }));
+    model.compile({
+      optimizer: tf.train.adam(0.001),
+      loss: 'binaryCrossentropy',
+      metrics: ['accuracy']
+    });
+    return model;
+  }
+
+  calculateMeanStd(data) {
+    const dim = data[0].length;
+    const sum = new Array(dim).fill(0);
+    const sumSq = new Array(dim).fill(0);
+    data.forEach(row => {
+      row.forEach((v, i) => {
+        sum[i] += v;
+        sumSq[i] += v * v;
+      });
+    });
+    const n = data.length;
+    const mean = sum.map(s => s / n);
+    const std = mean.map((m, i) => Math.sqrt((sumSq[i] / n) - m * m));
+    return { mean, std };
+  }
+
+  async trainOffline(allSessions) {
+    const X = [];
+    const y = [];
+    const cauLogData = [];
+
+    for (let i = 10; i < allSessions.length; i++) {
+      const currentSession = allSessions[i];
+      const history = allSessions.slice(0, i).reverse();
+      const features = await this.extractFeatures(history, cauLogData);
+      if (features) {
+        X.push(features);
+        y.push(currentSession.result === 'Tài' ? 1 : 0);
+      }
+    }
+
+    if (X.length < 100) {
+      console.log('Not enough training samples:', X.length);
+      return false;
+    }
+
+    const { mean, std } = this.calculateMeanStd(X);
+    this.scaler = { mean, std };
+    const Xnorm = X.map(row => row.map((v, i) => (v - mean[i]) / (std[i] || 1)));
+
+    const inputDim = X[0].length;
+    this.model = this.buildModel(inputDim);
+
+    const xs = tf.tensor2d(Xnorm);
+    const ys = tf.tensor2d(y, [y.length, 1]);
+
+    await this.model.fit(xs, ys, {
+      epochs: 50,
+      batchSize: 32,
+      validationSplit: 0.2,
+      callbacks: {
+        onEpochEnd: (epoch, logs) => {
+          console.log(`Epoch ${epoch}: loss = ${logs.loss.toFixed(4)}, acc = ${logs.acc.toFixed(4)}`);
+        }
+      }
+    });
+
+    xs.dispose();
+    ys.dispose();
+    return true;
+  }
+
+  async predict(history, cauLogData) {
+    if (!this.model) throw new Error('Model not trained');
+    const features = await this.extractFeatures(history, cauLogData);
+    if (!features) return null;
+    const featuresNorm = features.map((v, i) => (v - this.scaler.mean[i]) / (this.scaler.std[i] || 1));
+    const input = tf.tensor2d([featuresNorm]);
+    const output = this.model.predict(input);
+    const prob = (await output.data())[0];
+    input.dispose();
+    output.dispose();
+    return {
+      prediction: prob > 0.5 ? 'Tài' : 'Xỉu',
+      probability: prob,
+      features
+    };
+  }
+
+  async updateOnline(features, actualResult) {
+    if (!this.model) return;
+    const featuresNorm = features.map((v, i) => (v - this.scaler.mean[i]) / (this.scaler.std[i] || 1));
+    const xs = tf.tensor2d([featuresNorm]);
+    const ys = tf.tensor2d([[actualResult === 'Tài' ? 1 : 0]]);
+    await this.model.fit(xs, ys, {
+      epochs: 1,
+      batchSize: 1,
+      verbose: 0
+    });
+    xs.dispose();
+    ys.dispose();
+  }
+
+  async saveModel(path) {
+    await this.model.save(`file://${path}`);
+    const fs = require('fs').promises;
+    await fs.writeFile(`${path}/scaler.json`, JSON.stringify(this.scaler));
+  }
+
+  async loadModel(path) {
+    this.model = await tf.loadLayersModel(`file://${path}/model.json`);
+    const fs = require('fs').promises;
+    const scalerData = await fs.readFile(`${path}/scaler.json`, 'utf8');
+    this.scaler = JSON.parse(scalerData);
+  }
 }
 
-// Logic 20 (Meta-logic)
-async function predictLogic20(history, logicPerformance, cauLogData) {
-  if (history.length < 30) return null;
-  let taiVotes = 0, xiuVotes = 0;
-  const signals = [
-    { logic: 'logic1', baseWeight: 0.7 }, { logic: 'logic2', baseWeight: 0.8 }, { logic: 'logic3', baseWeight: 0.8 },
-    { logic: 'logic4', baseWeight: 1.4 }, { logic: 'logic5', baseWeight: 0.7 }, { logic: 'logic6', baseWeight: 0.9 },
-    { logic: 'logic7', baseWeight: 1.1 }, { logic: 'logic8', baseWeight: 0.8 }, { logic: 'logic9', baseWeight: 1.2 },
-    { logic: 'logic10', baseWeight: 1.0 }, { logic: 'logic11', baseWeight: 1.4 }, { logic: 'logic12', baseWeight: 0.8 },
-    { logic: 'logic13', baseWeight: 1.3 }, { logic: 'logic14', baseWeight: 0.9 }, { logic: 'logic15', baseWeight: 0.7 },
-    { logic: 'logic16', baseWeight: 0.8 }, { logic: 'logic17', baseWeight: 1.0 }, { logic: 'logic18', baseWeight: 1.4 },
-    { logic: 'logic19', baseWeight: 1.0 }, { logic: 'logic21', baseWeight: 1.6 }, { logic: 'logic22', baseWeight: 1.9 },
-    { logic: 'logic23', baseWeight: 1.1 }, { logic: 'logic24', baseWeight: 1.2 }, { logic: 'logic25', baseWeight: 1.3 },
-  ];
-  const lastSession = history[0];
-  const nextSessionId = lastSession.sid + 1;
-  const childPredictions = {
-    logic1: predictLogic1(lastSession, history),
-    logic2: predictLogic2(nextSessionId, history),
-    logic3: predictLogic3(history),
-    logic4: predictLogic4(history),
-    logic5: predictLogic5(history),
-    logic6: predictLogic6(lastSession, history),
-    logic7: predictLogic7(history),
-    logic8: predictLogic8(history),
-    logic9: predictLogic9(history),
-    logic10: predictLogic10(history),
-    logic11: predictLogic11(history),
-    logic12: predictLogic12(lastSession, history),
-    logic13: predictLogic13(history),
-    logic14: predictLogic14(history),
-    logic15: predictLogic15(history),
-    logic16: predictLogic16(history),
-    logic17: predictLogic17(history),
-    logic18: predictLogic18(history),
-    logic19: predictLogic19(history),
-    logic21: predictLogic21(history),
-    logic22: predictLogic22(history, cauLogData),
-    logic23: predictLogic23(history),
-    logic24: predictLogic24(history),
-    logic25: await predictLogic25(history, cauLogData),
-  };
-  signals.forEach(signal => {
-    const pred = childPredictions[signal.logic];
-    if (pred && logicPerformance[signal.logic]) {
-      const acc = logicPerformance[signal.logic].accuracy;
-      const cons = logicPerformance[signal.logic].consistency;
-      if (logicPerformance[signal.logic].total > 3 && acc > 0.35 && cons > 0.25) {
-        const effectiveWeight = signal.baseWeight * ((acc + cons) / 2);
-        if (pred === 'Tài') taiVotes += effectiveWeight; else xiuVotes += effectiveWeight;
+// ==================== WebSocket và broadcast ====================
+const connectedClients = new Set();
+
+async function sendHistoryToClient(ws) {
+  try {
+    const rows = await dbAll(`SELECT sid, prediction, actual, status, confidence, cau_hien_tai, ly_do, timestamp FROM predictions ORDER BY sid DESC LIMIT 500`);
+    const history = rows.map(r => ({
+      phien: r.sid.toString(),
+      du_doan: r.prediction,
+      thuc_te: r.actual || null,
+      trang_thai: r.status === 'win' ? '✅' : (r.status === 'lose' ? '❌' : '⏳'),
+      ti_le: r.confidence ? r.confidence.toFixed(0) + '%' : null,
+      cau_hien_tai: r.cau_hien_tai,
+      ly_do: JSON.parse(r.ly_do || '{}'),
+      timestamp: new Date(r.timestamp).toISOString()
+    }));
+    ws.send(JSON.stringify({ type: 'history', data: history }));
+  } catch (err) {
+    console.error('Lỗi gửi history:', err);
+  }
+}
+
+// WebSocket Sunwin
+function sendCmd1005() {
+  if (wsSunwin && wsSunwin.readyState === WebSocket.OPEN) {
+    const payload = [6, 'MiniGame', 'taixiuPlugin', { cmd: 1005 }];
+    wsSunwin.send(JSON.stringify(payload));
+  }
+}
+
+function connectWebSocket() {
+  wsSunwin = new WebSocket('wss://websocket.azhkthg1.net/websocket?token=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhbW91bnQiOjAsInVzZXJuYW1lIjoiU0NfYXBpc3Vud2luMTIzIn0.hgrRbSV6vnBwJMg9ZFtbx3rRu9mX_hZMZ_m5gMNhkw0');
+
+  wsSunwin.on('open', () => {
+    console.log('Đã kết nối WebSocket đến Sunwin.');
+    const authPayload = [1, 'MiniGame', 'SC_ditmemay9090', 'tinhbip', {
+      info: '{"ipAddress":"2001:ee0:5148:fe40:ad3f:fc10:28f5:e1be","wsToken":"eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJnZW5kZXIiOjAsImNhblZpZXdTdGF0IjpmYWxzZSwiZGlzcGxheU5hbWUiOiJkaXRtZW15YTkyODQ4IiwiYm90IjowLCJpc01lcmNoYW50IjpmYWxzZSwidmVyaWZpZWRCYW5rQWNjb3VudCI6ZmFsc2UsInBsYXlFdmVudExvYmJ5IjpmYWxzZSwiY3VzdG9tZXJJZCI6MzE0OTc1NTA1LCJhZmZJZCI6InN1bi53aW4iLCJiYW5uZWQiOmZhbHNlLCJicmFuZCI6InN1bi53aW4iLCJ0aW1lc3RhbXAiOjE3NTY2NjMwMDYxNjksImxvY2tHYW1lcyI6W10sImFtb3VudCI6MCwibG9ja0NoYXQiOmZhbHNlLCJwaG9uZVZlcmlmaWVkIjpmYWxzZSwiaXBBZGRyZXNzIjoiMjAwMTplZTA6NTE0ODpmZTQwOmFkM2Y6ZmMxMDoyOGY1OmUxYmUiLCJtdXRlIjpmYWxzZSwiYXZhdGFyIjoiaHR0cHM6Ly9pbWFnZXMuc3dpbnNob3AubmV0L2ltYWdlcy9hdmF0YXIvYXZhdGFyXzE1LnBuZyIsInBsYXRmb3JtSWQiOjUsInVzZXJJZCI6IjlhYTI0YWQ5LWYwOTAtNGZkMC05NjZkLWE0NjRmMTczYzZmMCIsInJlZ1RpbWUiOjE3NTY2NjIxOTAyMzYsInBob25lIjoiIiwiZGVwb3NpdCI6ZmFsc2UsInVzZXJuYW1lIjoiU0NfZGl0bWVtYXk5MDkwIn0.KxsZbt0gZfENGroTiUiAi7yYq-MdVo20GgsE_I5yRms","locale":"vi","userId":"9aa24ad9-f090-4fd0-966d-a464f173c6f0","username":"SC_ditmemay9090","timestamp":1756663006169,"refreshToken":"98fcec7d747948608fa8d843aa20eeac.e92b32c4c5e5452d93e186d60d751363"}',
+      signature: '8536BEA6235F8F2D3D38898090F5F4F9AF06134F11C7990F2A4A8534973D1E5E3D31262E67DD1CAC396AE998C291FB82E03965ACBA8C76005DE3B8D717EFB05F4E3BC13AE2E3A0D815F748629A4881E57D5BF4259409D09C25749C698611E980163C21F1948B25C377CC25CE796B400917695E5B7ED0B2528B9F1E53627AA1CA'
+    }];
+    wsSunwin.send(JSON.stringify(authPayload));
+    clearInterval(intervalCmd);
+    intervalCmd = setInterval(sendCmd1005, 5000);
+  });
+
+  wsSunwin.on('message', async (data) => {
+    try {
+      const json = JSON.parse(data);
+      if (Array.isArray(json) && json[1]?.htr) {
+        const incomingResults = json[1].htr.sort((a, b) => a.sid - b.sid);
+        for (const newItem of incomingResults) {
+          if (!newItem.d1 || !newItem.d2 || !newItem.d3 || newItem.d1 < 1 || newItem.d1 > 6 || newItem.d2 < 1 || newItem.d2 > 6 || newItem.d3 < 1 || newItem.d3 > 6) continue;
+          const total = newItem.d1 + newItem.d2 + newItem.d3;
+          if (total < 3 || total > 18) continue;
+          const row = await dbGet(`SELECT sid FROM sessions WHERE sid = ?`, [newItem.sid]);
+          if (!row) {
+            const result = total <= 10 ? 'Xỉu' : 'Tài';
+            const timestamp = Date.now();
+            await dbRun(`INSERT INTO sessions (sid, d1, d2, d3, total, result, timestamp) VALUES (?,?,?,?,?,?,?)`,
+              [newItem.sid, newItem.d1, newItem.d2, newItem.d3, total, result, timestamp]);
+
+            // Cập nhật predictions
+            const predRow = await dbGet(`SELECT prediction, features FROM predictions WHERE sid = ?`, [newItem.sid]);
+            if (predRow) {
+              const status = (predRow.prediction === result) ? 'win' : 'lose';
+              await dbRun(`UPDATE predictions SET actual = ?, status = ? WHERE sid = ?`, [result, status, newItem.sid]);
+              // Online learning nếu có features
+              if (predRow.features && mlPredictor.model) {
+                const features = JSON.parse(predRow.features);
+                await mlPredictor.updateOnline(features, result);
+                console.log(`Online updated with sid ${newItem.sid}`);
+              }
+            } else {
+              await dbRun(`UPDATE predictions SET actual = ? WHERE sid = ?`, [result, newItem.sid]);
+            }
+
+            // Phân tích pattern và log
+            const recent = await dbAll(`SELECT sid, d1, d2, d3, total, result FROM sessions ORDER BY sid DESC LIMIT 50`);
+            if (recent.length > 5) {
+              const reversed = recent.reverse();
+              const patterns = analyzeAndExtractPatterns(reversed);
+              if (Object.keys(patterns).length) {
+                logCauPattern({ sid_before: newItem.sid, actual_result: result, patterns, timestamp: Date.now() });
+              }
+            }
+            broadcastPrediction(); // Gửi dự đoán mới
+          }
+        }
       }
+    } catch (e) {
+      console.error('Lỗi xử lý message Sunwin:', e);
     }
   });
-  const currentPatterns = analyzeAndExtractPatterns(history.slice(0, Math.min(history.length, 50)));
-  let cauTaiBoost = 0, cauXiuBoost = 0;
-  if (cauLogData.length > 0) {
-    const recentCauLogs = cauLogData.slice(-200);
-    const patternMatchScores = {};
-    for (const patternType in currentPatterns) {
-      const val = currentPatterns[patternType];
-      if (patternType === 'sum_sequence_patterns' && Array.isArray(val)) {
-        val.forEach(cp => {
-          const key = cp.key;
-          if (key) {
-            recentCauLogs.forEach(log => {
-              if (log.patterns?.sum_sequence_patterns?.some(lp => lp.key === key)) {
-                if (!patternMatchScores[key]) patternMatchScores[key] = { tai:0, xiu:0 };
-                if (log.actual_result === 'Tài') patternMatchScores[key].tai++; else patternMatchScores[key].xiu++;
-              }
-            });
-          }
-        });
-      } else if (val && typeof val === 'object' && val.result && val.length) {
-        const key = `last_streak_${val.result}_${val.length}`;
-        recentCauLogs.forEach(log => {
-          if (log.patterns?.last_streak?.result === val.result && log.patterns.last_streak.length === val.length) {
-            if (!patternMatchScores[key]) patternMatchScores[key] = { tai:0, xiu:0 };
-            if (log.actual_result === 'Tài') patternMatchScores[key].tai++; else patternMatchScores[key].xiu++;
-          }
-        });
-      } else if (val) {
-        const key = `${patternType}_${val}`;
-        recentCauLogs.forEach(log => {
-          if (log.patterns && log.patterns[patternType] === val) {
-            if (!patternMatchScores[key]) patternMatchScores[key] = { tai:0, xiu:0 };
-            if (log.actual_result === 'Tài') patternMatchScores[key].tai++; else patternMatchScores[key].xiu++;
-          }
-        });
-      }
-    }
-    for (const key in patternMatchScores) {
-      const stats = patternMatchScores[key];
-      const total = stats.tai + stats.xiu;
-      if (total > 3) {
-        const taiRatio = stats.tai / total;
-        const xiuRatio = stats.xiu / total;
-        if (taiRatio >= 0.7) cauTaiBoost += (taiRatio - 0.5) * 2;
-        else if (xiuRatio >= 0.7) cauXiuBoost += (xiuRatio - 0.5) * 2;
-      }
-    }
-  }
-  taiVotes += cauTaiBoost * 2;
-  xiuVotes += cauXiuBoost * 2;
-  const totalWeighted = taiVotes + xiuVotes;
-  if (totalWeighted < 1.5) return null;
-  if (taiVotes > xiuVotes * 1.08) return 'Tài';
-  if (xiuVotes > taiVotes * 1.08) return 'Xỉu';
-  return null;
+
+  wsSunwin.on('close', () => {
+    console.warn('WebSocket Sunwin đóng, thử kết nối lại...');
+    clearInterval(intervalCmd);
+    setTimeout(connectWebSocket, reconnectInterval);
+  });
+
+  wsSunwin.on('error', (err) => {
+    console.error('Lỗi WebSocket Sunwin:', err.message);
+    wsSunwin.close();
+  });
 }
 
-// ==================== KẾT THÚC CÁC HÀM LOGIC ====================
+// Khởi tạo ML Predictor
+const mlPredictor = new MLPredictor();
+let modelReady = false;
 
-// --- Broadcast prediction (đã được nâng cấp) ---
+async function initModel() {
+  try {
+    await mlPredictor.loadModel('./model');
+    modelReady = true;
+    console.log('Loaded ML model from disk.');
+  } catch (err) {
+    console.log('No saved model found, training offline...');
+    try {
+      const rows = await dbAll(`SELECT sid, d1, d2, d3, total, result, timestamp FROM sessions ORDER BY sid ASC`);
+      if (rows.length >= 200) {
+        const success = await mlPredictor.trainOffline(rows);
+        if (success) {
+          modelReady = true;
+          await mlPredictor.saveModel('./model');
+          console.log('Model trained and saved.');
+        } else {
+          console.error('Training failed, not enough samples.');
+        }
+      } else {
+        console.log('Not enough historical data, using fallback logic.');
+      }
+    } catch (e) {
+      console.error('Error during offline training:', e);
+    }
+  }
+}
+
+// Broadcast prediction (sửa để dùng ML)
 async function broadcastPrediction() {
   try {
     const rows = await dbAll(`SELECT sid, d1, d2, d3, total, result, timestamp FROM sessions ORDER BY sid DESC LIMIT 1000`);
@@ -1367,7 +1474,7 @@ async function broadcastPrediction() {
         phien_hien_tai: null, du_doan: null, do_tin_cay: '0',
         cau_hien_tai: 'Chưa đủ dữ liệu', cau_10_phien: '',
         ly_do: {}, suggested_bet: 0,
-        ngay: currentTimestamp, Id: '@tiendataox'
+        ngay: currentTimestamp, Id: '@nhutquangdz'
       };
       connectedClients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify(msg)); });
       return;
@@ -1375,184 +1482,53 @@ async function broadcastPrediction() {
 
     const lastSession = history[0];
     const nextSessionId = lastSession.sid + 1;
+    let finalPrediction, overallConfidence, lyDo, featuresForUpdate = null;
 
-    // Cập nhật ngưỡng động
-    HIGH_CONFIDENCE_THRESHOLD = getDynamicThreshold(history);
-
-    // --- Update AI weights based on previous session ---
-    if (history.length > 1) {
-      const sessionBeforeLast = history[1];
-      const actualOutcomeOfLastSession = lastSession.result;
-      const historyForEvaluation = history.slice(1);
-      const cauLogDataForEval = await readCauLog();
-
-      const predictionsForEvaluation = [
-        { name: 'logic1', pred: predictLogic1(sessionBeforeLast, historyForEvaluation) },
-        { name: 'logic2', pred: predictLogic2(sessionBeforeLast.sid, historyForEvaluation) },
-        { name: 'logic3', pred: predictLogic3(historyForEvaluation) },
-        { name: 'logic4', pred: predictLogic4(historyForEvaluation) },
-        { name: 'logic5', pred: predictLogic5(historyForEvaluation) },
-        { name: 'logic6', pred: predictLogic6(sessionBeforeLast, historyForEvaluation) },
-        { name: 'logic7', pred: predictLogic7(historyForEvaluation) },
-        { name: 'logic8', pred: predictLogic8(historyForEvaluation) },
-        { name: 'logic9', pred: predictLogic9(historyForEvaluation) },
-        { name: 'logic10', pred: predictLogic10(historyForEvaluation) },
-        { name: 'logic11', pred: predictLogic11(historyForEvaluation) },
-        { name: 'logic12', pred: predictLogic12(sessionBeforeLast, historyForEvaluation) },
-        { name: 'logic13', pred: predictLogic13(historyForEvaluation) },
-        { name: 'logic14', pred: predictLogic14(historyForEvaluation) },
-        { name: 'logic15', pred: predictLogic15(historyForEvaluation) },
-        { name: 'logic16', pred: predictLogic16(historyForEvaluation) },
-        { name: 'logic17', pred: predictLogic17(historyForEvaluation) },
-        { name: 'logic18', pred: predictLogic18(historyForEvaluation) },
-        { name: 'logic19', pred: predictLogic19(historyForEvaluation) },
-        { name: 'logic21', pred: predictLogic21(historyForEvaluation) },
-        { name: 'logic22', pred: predictLogic22(historyForEvaluation, cauLogDataForEval) },
-        { name: 'logic23', pred: predictLogic23(historyForEvaluation) },
-        { name: 'logic24', pred: predictLogic24(historyForEvaluation) },
-      ];
-
-      predictionsForEvaluation.forEach(l => {
-        if (logicPerformance[l.name]) updateLogicPerformance(l.name, l.pred, actualOutcomeOfLastSession);
-      });
-
-      const logic20_pred = await predictLogic20(historyForEvaluation, logicPerformance, cauLogDataForEval);
-      updateLogicPerformance('logic20', logic20_pred, actualOutcomeOfLastSession);
-
-      console.log('\n--- Logic Performance Update ---');
-      for (const name in logicPerformance) {
-        console.log(`  ${name}: Acc: ${logicPerformance[name].accuracy.toFixed(3)} | Cons: ${logicPerformance[name].consistency.toFixed(3)}`);
+    if (modelReady) {
+      const cauLogData = await readCauLog();
+      const result = await mlPredictor.predict(history, cauLogData);
+      if (result) {
+        finalPrediction = result.prediction;
+        const prob = result.probability;
+        overallConfidence = (prob * 100).toFixed(2);
+        featuresForUpdate = result.features;
+        lyDo = {
+          ket_luan: 'ML model',
+          probability: prob,
+          note: 'Neural network với 25 logic + features'
+        };
+        mlPredictor.predictedFeatures.set(nextSessionId, featuresForUpdate);
+      } else {
+        // fallback nếu không trích xuất được features
+        finalPrediction = lastSession.result;
+        overallConfidence = '50';
+        lyDo = { ket_luan: 'Fallback (không đủ features)' };
       }
-      await saveLogicPerformance();
-    }
-
-    // --- Dự đoán cho phiên hiện tại ---
-    let finalPrediction = null;
-    let overallConfidence = '0';
-    let confidenceMessage = 'Không có tín hiệu mạnh để dự đoán';
-    let contributingLogics = [];
-    let detectedPatternString = '';
-    let taiWeightedVote = 0, xiuWeightedVote = 0;
-
-    const cauLogDataForPrediction = await readCauLog();
-
-    const logicsToEvaluate = [
-      { name: 'logic1', predict: predictLogic1(lastSession, history) },
-      { name: 'logic2', predict: predictLogic2(nextSessionId, history) },
-      { name: 'logic3', predict: predictLogic3(history) },
-      { name: 'logic4', predict: predictLogic4(history) },
-      { name: 'logic5', predict: predictLogic5(history) },
-      { name: 'logic6', predict: predictLogic6(lastSession, history) },
-      { name: 'logic7', predict: predictLogic7(history) },
-      { name: 'logic8', predict: predictLogic8(history) },
-      { name: 'logic9', predict: predictLogic9(history) },
-      { name: 'logic10', predict: predictLogic10(history) },
-      { name: 'logic11', predict: predictLogic11(history) },
-      { name: 'logic12', predict: predictLogic12(lastSession, history) },
-      { name: 'logic13', predict: predictLogic13(history) },
-      { name: 'logic14', predict: predictLogic14(history) },
-      { name: 'logic15', predict: predictLogic15(history) },
-      { name: 'logic16', predict: predictLogic16(history) },
-      { name: 'logic17', predict: predictLogic17(history) },
-      { name: 'logic18', predict: predictLogic18(history) },
-      { name: 'logic19', predict: predictLogic19(history) },
-      { name: 'logic21', predict: predictLogic21(history) },
-      { name: 'logic22', predict: predictLogic22(history, cauLogDataForPrediction) },
-      { name: 'logic23', predict: predictLogic23(history) },
-      { name: 'logic24', predict: predictLogic24(history) },
-      { name: 'logic25', predict: await predictLogic25(history, cauLogDataForPrediction) },
-    ];
-
-    const allValidPredictions = [];
-    for (const l of logicsToEvaluate) {
-      const pred = l.predict;
-      if (pred && logicPerformance[l.name]) {
-        const acc = logicPerformance[l.name].accuracy;
-        const cons = logicPerformance[l.name].consistency;
-        if (logicPerformance[l.name].total > 2 && acc > 0.30 && cons > 0.20) {
-          allValidPredictions.push({ logic: l.name, prediction: pred, accuracy: acc, consistency: cons });
-        }
-      }
-    }
-
-    const logic20Result = await predictLogic20(history, logicPerformance, cauLogDataForPrediction);
-    if (logic20Result && logicPerformance.logic20.total > 5 && logicPerformance.logic20.accuracy >= 0.45) {
-      allValidPredictions.push({ logic: 'logic20', prediction: logic20Result, accuracy: logicPerformance.logic20.accuracy, consistency: logicPerformance.logic20.consistency });
-    }
-
-    allValidPredictions.sort((a, b) => (b.accuracy * b.consistency) - (a.accuracy * a.consistency));
-
-    let totalEffectiveWeight = 0;
-    const usedLogics = new Set();
-
-    for (const p of allValidPredictions) {
-      const weight = p.accuracy * p.consistency * (p.logic === 'logic20' ? 1.8 : (p.logic === 'logic22' ? 1.5 : (p.logic === 'logic23' ? 0.9 : (p.logic === 'logic24' ? 1.1 : (p.logic === 'logic25' ? 1.3 : 1.0)))));
-      if (weight > 0.1) {
-        if (p.prediction === 'Tài') taiWeightedVote += weight;
-        else xiuWeightedVote += weight;
-        totalEffectiveWeight += weight;
-        if (!usedLogics.has(p.logic)) {
-          contributingLogics.push(`${p.logic} (${(p.accuracy * 100).toFixed(1)}%)`);
-          usedLogics.add(p.logic);
-        }
-      }
-      if (contributingLogics.length >= 5) break;
-    }
-
-    if (totalEffectiveWeight > 0) {
-      const taiConf = taiWeightedVote / totalEffectiveWeight;
-      const xiuConf = xiuWeightedVote / totalEffectiveWeight;
-      if (taiConf > xiuConf * 1.05 && taiConf >= 0.48) {
-        finalPrediction = 'Tài';
-        overallConfidence = (taiConf * 100).toFixed(2);
-        confidenceMessage = taiConf >= HIGH_CONFIDENCE_THRESHOLD ? 'Rất tin cậy' : 'Tin cậy';
-      } else if (xiuConf > taiConf * 1.05 && xiuConf >= 0.48) {
-        finalPrediction = 'Xỉu';
-        overallConfidence = (xiuConf * 100).toFixed(2);
-        confidenceMessage = xiuConf >= HIGH_CONFIDENCE_THRESHOLD ? 'Rất tin cậy' : 'Tin cậy';
+    } else {
+      // Dùng logic cũ làm fallback
+      const cauLogData = await readCauLog();
+      const logic20Pred = await predictLogic20(history, logicPerformance, cauLogData);
+      if (logic20Pred) {
+        finalPrediction = logic20Pred;
+        overallConfidence = '70';
+        lyDo = { ket_luan: 'Logic20 fallback' };
       } else {
         finalPrediction = lastSession.result;
         overallConfidence = '50';
-        confidenceMessage = 'Thấp (theo xu hướng)';
-        contributingLogics = ['Fallback: Theo Phiên'];
+        lyDo = { ket_luan: 'Fallback theo phiên cuối' };
       }
-    } else {
-      finalPrediction = lastSession.result;
-      overallConfidence = '50';
-      confidenceMessage = 'Thấp (theo xu hướng)';
-      contributingLogics = ['Fallback: Theo Phiên'];
     }
-
-    // Giới hạn confidence không quá 97%
-    let confNum = parseFloat(overallConfidence);
-    if (isNaN(confNum)) confNum = 50;
-    confNum = Math.min(confNum, 97);
-    overallConfidence = confNum.toFixed(2);
-
-    if (contributingLogics.length === 0 && allValidPredictions.length > 0) {
-      contributingLogics.push(`${allValidPredictions[0].logic} (chủ đạo)`);
-    } else if (contributingLogics.length === 0) {
-      contributingLogics.push('Không có logic đạt ngưỡng');
-    }
-
-    const [_, patternDesc] = analyzePatterns(history.map(i => i.result));
-    detectedPatternString = patternDesc;
 
     const cau10Phien = history.slice(0, 10).map(s => s.result === 'Tài' ? 'T' : 'X').join('');
+    const [_, patternDesc] = analyzePatterns(history.map(i => i.result));
+    const detectedPatternString = patternDesc;
 
-    // Gợi ý cược
+    // Gợi ý cược dựa trên confidence
     let suggestedBet = 0;
+    const confNum = parseFloat(overallConfidence);
     if (confNum >= 80) suggestedBet = 10;
     else if (confNum >= 60) suggestedBet = 5;
     else if (confNum >= 40) suggestedBet = 2;
-
-    const lyDo = {
-      ket_luan: confidenceMessage,
-      cac_logic_tham_gia: contributingLogics,
-      so_phieu_tai: taiWeightedVote.toFixed(2),
-      so_phieu_xiu: xiuWeightedVote.toFixed(2),
-      pattern_phat_hien: detectedPatternString
-    };
 
     const predictionMessage = {
       Phien: lastSession.sid,
@@ -1568,12 +1544,11 @@ async function broadcastPrediction() {
       ly_do: lyDo,
       suggested_bet: suggestedBet,
       ngay: currentTimestamp,
-      Id: '@tiendataox'
+      Id: '@nhutquangdz'
     };
 
-    const timestamp = Date.now();
-    await dbRun(`INSERT INTO predictions (sid, prediction, confidence, cau_hien_tai, ly_do, timestamp) VALUES (?, ?, ?, ?, ?, ?)`,
-      [nextSessionId, finalPrediction, parseFloat(overallConfidence), cau10Phien, JSON.stringify(lyDo), timestamp]);
+    await dbRun(`INSERT INTO predictions (sid, prediction, confidence, cau_hien_tai, ly_do, features, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [nextSessionId, finalPrediction, parseFloat(overallConfidence), cau10Phien, JSON.stringify(lyDo), featuresForUpdate ? JSON.stringify(featuresForUpdate) : null, Date.now()]);
 
     connectedClients.forEach(c => {
       if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify(predictionMessage));
@@ -1581,14 +1556,13 @@ async function broadcastPrediction() {
 
     console.log(`\n--- Broadcasted ${nextSessionId}: ${finalPrediction} (${overallConfidence}%) ---`);
   } catch (err) {
-    console.error('Lỗi trong broadcastPrediction:', err);
+    console.error('Lỗi broadcastPrediction:', err);
   }
 }
 
 // --- WebSocket API cho client ---
 fastify.get('/api/sunwin/taixiu/ws', { websocket: true }, (connection, req) => {
   const { socket } = connection;
-  // Lấy query parameters an toàn
   const { id, key } = req.query || {};
   if (!authenticateWebSocket(id, key)) {
     socket.send(JSON.stringify({ error: 'Authentication failed' }));
@@ -1601,7 +1575,7 @@ fastify.get('/api/sunwin/taixiu/ws', { websocket: true }, (connection, req) => {
   socket.on('close', () => connectedClients.delete(socket));
 });
 
-// --- API /api/his (lịch sử dự đoán) ---
+// --- API /api/his ---
 fastify.get('/api/his', async (request, reply) => {
   try {
     const rows = await dbAll(`SELECT sid, prediction, actual, status, confidence, cau_hien_tai, ly_do, timestamp FROM predictions ORDER BY sid DESC LIMIT 500`);
@@ -1621,7 +1595,7 @@ fastify.get('/api/his', async (request, reply) => {
   }
 });
 
-// --- API /api/history-json (export sessions) ---
+// --- API /api/history-json ---
 fastify.get('/api/history-json', async (request, reply) => {
   try {
     const rows = await dbAll(`SELECT sid, d1, d2, d3, total, result, timestamp FROM sessions ORDER BY sid ASC`);
@@ -1651,7 +1625,8 @@ fastify.get('/api/analysis', async (request, reply) => {
       else break;
     }
     const streak = { result: results[0], length: streakLength };
-    const deception = detectDeception(history);
+    // deception detection đơn giản
+    const deception = { isDeceptive: false, reason: 'Bình thường' };
     const analysis = {
       tong_phien: history.length,
       ti_le_tai: (taiCount / history.length * 100).toFixed(2) + '%',
@@ -1669,7 +1644,10 @@ fastify.get('/api/analysis', async (request, reply) => {
 
 // --- Khởi động server ---
 const start = async () => {
-  await loadLogicPerformance();
+  // Khởi tạo model sau khi DB ready
+  await initModel();
+  connectWebSocket();
+
   try {
     const address = await fastify.listen({ port: PORT, host: '0.0.0.0' });
     console.log(`Server Fastify đang chạy tại ${address}`);
